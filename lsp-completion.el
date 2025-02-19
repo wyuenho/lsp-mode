@@ -287,7 +287,7 @@ Returns unresolved completion item detail."
 
 (defvar lsp-completion--cache nil
   "Cached candidates for completion at point function.
-In the form of plist (prefix-pos items :lsp-items :prefix ...).
+In the form of plist (prefix-pos items :prefix ...).
 When the completion is incomplete, `items' contains value of :incomplete.")
 
 (defvar lsp-completion--last-result nil
@@ -334,62 +334,49 @@ Return `nil' when fails to guess prefix."
 
 (defun lsp-completion--to-internal (items)
   "Convert ITEMS into internal form."
-  (--> items
-    (-map (-lambda ((item &as &CompletionItem
-                          :label
-                          :filter-text?
-                          :_emacsStartPoint start-point
-                          :score?))
-            `( :label ,(or (unless (lsp-falsy? filter-text?) filter-text?) label)
-               :item ,item
-               :start-point ,start-point
-               :score ,score?))
-          it)))
+  (-map (-lambda ((item &as &CompletionItem
+                        :label
+                        :filter-text?
+                        :_emacsStartPoint start-point
+                        :score?))
+          `( :label ,(or filter-text? label)
+             :item ,item
+             :start-point ,start-point
+             :score ,score?))
+        items))
 
-(cl-defun lsp-completion--filter-candidates (items &key
-                                                   lsp-items
-                                                   markers
-                                                   prefix
-                                                   &allow-other-keys)
-  "List all possible completions in cached ITEMS with their prefixes.
-We can pass LSP-ITEMS, which will be used when there's no cache.
-The MARKERS and PREFIX value will be attached to each candidate."
+(defun lsp-completion--filter-candidates (items)
+  "List all possible completions in cached ITEMS with their prefixes."
   (lsp--while-no-input
-    (->>
-     (if items
-         (--> (let (queries fuz-queries)
-                (-keep (-lambda ((cand &as &plist :label :start-point :score))
-                         (let* ((query (or (plist-get queries start-point)
-                                           (let ((s (buffer-substring-no-properties
-                                                     start-point (point))))
-                                             (setq queries (plist-put queries start-point s))
-                                             s)))
-                                (fuz-query (or (plist-get fuz-queries start-point)
-                                               (let ((s (lsp-completion--regex-fuz query)))
-                                                 (setq fuz-queries
-                                                       (plist-put fuz-queries start-point s))
-                                                 s)))
-                                (label-len (length label))
-                                (case-fold-search completion-ignore-case))
-                           (when (string-match fuz-query label)
-                             (put-text-property 0 label-len 'match-data (match-data) label)
-                             (plist-put cand
-                                        :sort-score
-                                        (* (or (lsp-completion--fuz-score query label) 1e-05)
-                                           (or score 0.001)))
-                             cand)))
-                       items))
-              (if lsp-completion--no-reordering
-                  it
-                (sort it (lambda (o1 o2)
-                           (> (plist-get o1 :sort-score)
-                              (plist-get o2 :sort-score)))))
-              ;; TODO: pass additional function to sort the candidates
-              (-map (-rpartial #'plist-get :item) it))
-       lsp-items)
-     (-map (lambda (item) (lsp-completion--make-item item
-                                                     :markers markers
-                                                     :prefix prefix))))))
+    (--> (let (queries fuz-queries)
+           (-keep (-lambda ((cand &as &plist :label :start-point :score))
+                    (let* ((query (or (plist-get queries start-point)
+                                      (let ((s (buffer-substring-no-properties
+                                                start-point (point))))
+                                        (setq queries (plist-put queries start-point s))
+                                        s)))
+                           (fuz-query (or (plist-get fuz-queries start-point)
+                                          (let ((s (lsp-completion--regex-fuz query)))
+                                            (setq fuz-queries
+                                                  (plist-put fuz-queries start-point s))
+                                            s)))
+                           (label-len (length label))
+                           (case-fold-search completion-ignore-case))
+                      (when (string-match fuz-query label)
+                        (put-text-property 0 label-len 'match-data (match-data) label)
+                        (plist-put cand
+                                   :sort-score
+                                   (* (or (lsp-completion--fuz-score query label) 1e-05)
+                                      (or score 0.001)))
+                        cand)))
+                  items))
+         (if lsp-completion--no-reordering
+             it
+           (sort it (lambda (o1 o2)
+                      (> (plist-get o1 :sort-score)
+                         (plist-get o2 :sort-score)))))
+         ;; TODO: pass additional function to sort the candidates
+         (-map (-rpartial #'plist-get :item) it))))
 
 (defconst lsp-completion--kind->symbol
   '((1 . text)
@@ -589,9 +576,15 @@ Returns resolved completion item details."
                      ((or done? result) result)
                      ((and (not lsp-completion-no-cache)
                            same-session?
-                           (listp (cl-second lsp-completion--cache)))
-                      (setf result (apply #'lsp-completion--filter-candidates
-                                          (cdr lsp-completion--cache))))
+                           (cl-second lsp-completion--cache))
+                      (setf result (let* ((cached-args (cddr lsp-completion--cache))
+                                          (items (cl-second lsp-completion--cache))
+                                          (markers (plist-get cached-args :markers))
+                                          (prefix (plist-get cached-args :prefix)))
+                                     (-map
+                                      (lambda (item)
+                                        (lsp-completion--make-item item :markers markers :prefix prefix))
+                                      (lsp-completion--filter-candidates items)))))
                      (t
                       (-let* ((resp (lsp-request-while-no-input
                                      "textDocument/completion"
@@ -610,11 +603,16 @@ Returns resolved completion item details."
                                                 (lsp-completion--sort-completions it)
                                               it)
                                             (-map (lambda (item)
+                                                    ;; FIXME: should we ever deal with the hash-table case?
                                                     (lsp-put item
                                                              :_emacsStartPoint
                                                              (or (lsp-completion--guess-prefix item)
                                                                  bounds-start)))
-                                                  it))))
+                                                  it)
+                                            (-remove
+                                             (-lambda ((&CompletionItem :filter-text? :label))
+                                               (and (lsp-falsy? filter-text?) (lsp-falsy? label)))
+                                             it))))
                               (markers (list bounds-start (copy-marker (point) t)))
                               (prefix (buffer-substring-no-properties bounds-start (point)))
                               (lsp-completion--no-reordering (not lsp-completion-sort-initial-results)))
@@ -625,17 +623,16 @@ Returns resolved completion item details."
                                                            ((and done? (not (seq-empty-p items)))
                                                             (lsp-completion--to-internal items))
                                                            ((not done?) :incomplete))
-                                                          :lsp-items nil
                                                           :markers markers
                                                           :prefix prefix)
-                              result (lsp-completion--filter-candidates
-                                      (cond (done?
-                                             (cl-second lsp-completion--cache))
-                                            (lsp-completion-filter-on-incomplete
-                                             (lsp-completion--to-internal items)))
-                                      :lsp-items items
-                                      :markers markers
-                                      :prefix prefix))))))
+                              result (when-let ((items
+                                                 (or (and done? (cl-second lsp-completion--cache))
+                                                     (and lsp-completion-filter-on-incomplete
+                                                          (lsp-completion--to-internal items)))))
+                                       (-map
+                                        (lambda (item)
+                                          (lsp-completion--make-item item :markers markers :prefix prefix))
+                                        (lsp-completion--filter-candidates items))))))))
                 (:interrupted lsp-completion--last-result)
                 (`,res (setq lsp-completion--last-result res))))))
       (list
